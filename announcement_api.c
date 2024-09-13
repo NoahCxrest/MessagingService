@@ -76,10 +76,10 @@ static void handle_get_announcement(struct mg_connection *c) {
     time_t expires_at;
 
     if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
-        mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
+        mg_http_reply(c, 200, cors_headers, 
                       "{\"message\":\"%s\",\"expiresat\":%ld}", buffer, (long)expires_at);
     } else {
-        mg_http_reply(c, 204, NULL, "");
+        mg_http_reply(c, 204, cors_headers, "");
     }
 }
 
@@ -101,7 +101,7 @@ static void handle_set_announcement(struct mg_connection *c, struct mg_http_mess
     }
 
     int result = set_announcement(message, expires_at, token);
-    mg_http_reply(c, result == 1 ? 201 : 401, "Content-Type: application/json\r\n", 
+    mg_http_reply(c, result == 1 ? 201 : 401, cors_headers, 
                   result == 1 ? "{\"status\":\"success\"}" : "{\"status\":\"unauthorized\"}");
 }
 
@@ -113,7 +113,7 @@ static void handle_clear_announcement(struct mg_connection *c, struct mg_http_me
         free(token_str);
     }
     clear_announcement(token);
-    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "{\"status\":\"success\"}");
+    mg_http_reply(c, 200, cors_headers, "{\"status\":\"success\"}");
 }
 
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
@@ -126,14 +126,18 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
                 handle_set_announcement(c, hm);
             } else if (mg_strcmp(hm->method, mg_str("DELETE")) == 0) {
                 handle_clear_announcement(c, hm);
+            } else if (mg_strcmp(hm->method, mg_str("OPTIONS")) == 0) {
+                // Handle preflight CORS requests
+                mg_http_reply(c, 200, cors_headers, "");
             } else {
-                mg_http_reply(c, 405, NULL, "{\"status\":\"method not allowed\"}");
+                mg_http_reply(c, 405, cors_headers, "{\"status\":\"method not allowed\"}");
             }
         } else {
-            mg_http_reply(c, 404, NULL, "{\"status\":\"not found\"}");
+            mg_http_reply(c, 404, cors_headers, "{\"status\":\"not found\"}");
         }
     }
 }
+
 
 int main(void) {
     const char *env_token = getenv("ANNOUNCEMENT_AUTH_TOKEN");
