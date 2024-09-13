@@ -39,7 +39,7 @@ static inline bool get_announcement(char *buffer, size_t buffer_size, time_t *ex
     acquire_lock();
     has_announcement = current_announcement.flags.has_announcement && current_announcement.expires_at > time(NULL);
     if (has_announcement) {
-        memcpy(buffer, current_announcement.message, buffer_size - 1);
+        strncpy(buffer, current_announcement.message, buffer_size - 1);
         buffer[buffer_size - 1] = '\0';
         *expires_at = current_announcement.expires_at;
     }
@@ -88,8 +88,17 @@ static void handle_set_announcement(struct mg_connection *c, struct mg_http_mess
     char token[AUTH_TOKEN_LENGTH + 1] = {0};
     time_t expires_at = mg_json_get_long(hm->body, "$.expiresat", 0);
 
-    mg_json_get_string(hm->body, "$.message", message, sizeof(message));
-    mg_json_get_string(hm->body, "$.token", token, sizeof(token));
+    char *msg_str = mg_json_get_str(hm->body, "$.message");
+    if (msg_str) {
+        strncpy(message, msg_str, sizeof(message) - 1);
+        free(msg_str);
+    }
+
+    char *token_str = mg_json_get_str(hm->body, "$.token");
+    if (token_str) {
+        strncpy(token, token_str, sizeof(token) - 1);
+        free(token_str);
+    }
 
     int result = set_announcement(message, expires_at, token);
     mg_http_reply(c, result == 1 ? 201 : 401, "Content-Type: application/json\r\n", 
@@ -98,7 +107,11 @@ static void handle_set_announcement(struct mg_connection *c, struct mg_http_mess
 
 static void handle_clear_announcement(struct mg_connection *c, struct mg_http_message *hm) {
     char token[AUTH_TOKEN_LENGTH + 1] = {0};
-    mg_json_get_string(hm->body, "$.token", token, sizeof(token));
+    char *token_str = mg_json_get_str(hm->body, "$.token");
+    if (token_str) {
+        strncpy(token, token_str, sizeof(token) - 1);
+        free(token_str);
+    }
     clear_announcement(token);
     mg_http_reply(c, 200, "Content-Type: application/json\r\n", "{\"status\":\"success\"}");
 }
@@ -106,7 +119,7 @@ static void handle_clear_announcement(struct mg_connection *c, struct mg_http_me
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     if (ev == MG_EV_HTTP_MSG) {
         struct mg_http_message *hm = (struct mg_http_message *) ev_data;
-        if (mg_http_match_uri(hm, "/announcement")) {
+        if (mg_strcmp(hm->uri, mg_str("/announcement")) == 0) {
             if (mg_strcmp(hm->method, mg_str("GET")) == 0) {
                 handle_get_announcement(c);
             } else if (mg_strcmp(hm->method, mg_str("POST")) == 0) {
