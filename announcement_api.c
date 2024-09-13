@@ -21,6 +21,10 @@ typedef struct {
 
 static Announcement current_announcement = {.message = "", .expires_at = 0, .flags = {0, 0}};
 static _Atomic int spinlock = 0;
+const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
+                           "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
+                           "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+
 
 static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0};  // Authorization token
 
