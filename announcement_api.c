@@ -4,12 +4,10 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdatomic.h>
-#include <limits.h>
 #include "mongoose.h"
 
 #define MAX_MESSAGE_LENGTH 256
 #define AUTH_TOKEN_LENGTH 24
-#define MAX_CONNECTIONS 1000000
 
 typedef struct {
     unsigned int has_announcement : 1;
@@ -28,12 +26,14 @@ static atomic_int connection_count = 0;
 const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
                            "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
                            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
-static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0}; 
+static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0};
 static struct mg_mgr mgr;
 
 static inline void acquire_lock(void) {
     while (atomic_flag_test_and_set(&spinlock)) {
-        mg_mgr_poll(&mgr, 0);
+        // Spin-wait with a brief pause to avoid busy-waiting
+        struct timespec ts = {0, 1000000}; // 1 ms
+        nanosleep(&ts, NULL);
     }
 }
 
@@ -80,8 +80,7 @@ static inline void clear_announcement(const char *token) {
         snprintf(broadcast_message, sizeof(broadcast_message), "{\"type\":\"announcement_cleared\"}");
 
         size_t message_len = strlen(broadcast_message);
-        struct mg_connection *c;
-        for (c = mgr.conns; c != NULL; c = c->next) {
+        for (struct mg_connection *c = mgr.conns; c != NULL; c = c->next) {
             if (c->is_websocket) {
                 mg_ws_send(c, broadcast_message, message_len, WEBSOCKET_OP_BINARY);
             }
@@ -100,8 +99,7 @@ static void broadcast_announcement(void) {
                  buffer, (long)expires_at);
 
         size_t message_len = strlen(broadcast_message);
-        struct mg_connection *c;
-        for (c = mgr.conns; c != NULL; c = c->next) {
+        for (struct mg_connection *c = mgr.conns; c != NULL; c = c->next) {
             if (c->is_websocket) {
                 mg_ws_send(c, broadcast_message, message_len, WEBSOCKET_OP_BINARY);
             }
@@ -178,14 +176,7 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
             atomic_fetch_sub(&connection_count, 1);
         }
     } else if (ev == MG_EV_WS_MSG) {
-        struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
-        uint8_t msg_type = wm->flags & 0x0F;
-
-        if (msg_type == WEBSOCKET_OP_TEXT) {
-            // placeholder
-        } else if (msg_type == WEBSOCKET_OP_BINARY) {
-            // placeholder
-        }
+       //yes yes
     }
 }
 
@@ -227,7 +218,7 @@ int main(void) {
     mg_http_listen(&mgr, "http://0.0.0.0:5671", ev_handler, NULL);
     printf("Starting Announcement API server on port 5671\n");
 
-    for (;;) {
+    while (true) {
         mg_mgr_poll(&mgr, 1000);
     }
 
