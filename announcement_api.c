@@ -6,13 +6,10 @@
 #include <stdatomic.h>
 #include <limits.h>
 #include "mongoose.h"
-#include <sys/epoll.h>
-#include <unistd.h>
 
 #define MAX_MESSAGE_LENGTH 256
 #define AUTH_TOKEN_LENGTH 24
 #define MAX_CONNECTIONS 1000000
-#define EPOLL_MAX_EVENTS 1000
 
 typedef struct {
     unsigned int has_announcement : 1;
@@ -36,7 +33,6 @@ static struct mg_mgr mgr;
 
 static inline void acquire_lock(void) {
     while (atomic_flag_test_and_set(&spinlock)) {
-        // Busy-wait loop, in a real-world scenario consider using an alternative approach
         mg_mgr_poll(&mgr, 0);
     }
 }
@@ -231,29 +227,10 @@ int main(void) {
     mg_http_listen(&mgr, "http://0.0.0.0:5671", ev_handler, NULL);
     printf("Starting Announcement API server on port 5671\n");
 
-    // Use epoll for efficient event handling
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd == -1) {
-        perror("epoll_create1");
-        return 1;
-    }
-
-    struct epoll_event events[EPOLL_MAX_EVENTS];
-
     for (;;) {
-        int nfds = epoll_wait(epoll_fd, events, EPOLL_MAX_EVENTS, 1000);
-        if (nfds == -1) {
-            perror("epoll_wait");
-            break;
-        }
-
-        for (int i = 0; i < nfds; i++) {
-            struct mg_connection *c = (struct mg_connection *) events[i].data.ptr;
-            mg_mgr_poll(&mgr, 0);
-        }
+        mg_mgr_poll(&mgr, 1000);
     }
 
     mg_mgr_free(&mgr);
-    close(epoll_fd);
     return 0;
 }
