@@ -4,10 +4,15 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include "mongoose.h"
+#include <sys/epoll.h>
+#include <unistd.h>
 
 #define MAX_MESSAGE_LENGTH 256
 #define AUTH_TOKEN_LENGTH 24
+#define MAX_CONNECTIONS 1000000
+#define EPOLL_MAX_EVENTS 1000
 
 typedef struct {
     unsigned int has_announcement : 1;
@@ -22,16 +27,16 @@ typedef struct {
 
 static Announcement current_announcement = {.message = "", .expires_at = 0, .flags = {0, 0}};
 static atomic_flag spinlock = ATOMIC_FLAG_INIT;
+static atomic_int connection_count = 0;
 const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
                            "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
                            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
-
-static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0};  // Authorization token
-
-static struct mg_mgr mgr;  // Mongoose event manager
+static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0}; 
+static struct mg_mgr mgr;
 
 static inline void acquire_lock(void) {
     while (atomic_flag_test_and_set(&spinlock)) {
+        // Busy-wait loop, in a real-world scenario consider using an alternative approach
         mg_mgr_poll(&mgr, 0);
     }
 }
@@ -57,7 +62,7 @@ static inline int set_announcement(const char *message, time_t expires_at, const
     if (memcmp(token, auth_token, AUTH_TOKEN_LENGTH) != 0) {
         return -1;  // Unauthorized
     }
-    
+
     acquire_lock();
     strncpy(current_announcement.message, message, MAX_MESSAGE_LENGTH - 1);
     current_announcement.message[MAX_MESSAGE_LENGTH - 1] = '\0';
@@ -75,32 +80,34 @@ static inline void clear_announcement(const char *token) {
         current_announcement.flags.has_announcement = 0;
         release_lock();
 
-        // Broadcast that the announcement has been cleared
         char broadcast_message[512];
         snprintf(broadcast_message, sizeof(broadcast_message), "{\"type\":\"announcement_cleared\"}");
 
-        for (struct mg_connection *c = mgr.conns; c != NULL; c = c->next) {
+        size_t message_len = strlen(broadcast_message);
+        struct mg_connection *c;
+        for (c = mgr.conns; c != NULL; c = c->next) {
             if (c->is_websocket) {
-                mg_ws_send(c, broadcast_message, strlen(broadcast_message), WEBSOCKET_OP_TEXT);
+                mg_ws_send(c, broadcast_message, message_len, WEBSOCKET_OP_BINARY);
             }
         }
     }
 }
 
-
-static void broadcast_announcement(struct mg_mgr *mgr) {
+static void broadcast_announcement(void) {
     char buffer[MAX_MESSAGE_LENGTH];
     time_t expires_at;
-    
+
     if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
         char broadcast_message[512];
-        snprintf(broadcast_message, sizeof(broadcast_message), 
-                 "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}", 
+        snprintf(broadcast_message, sizeof(broadcast_message),
+                 "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
                  buffer, (long)expires_at);
-        
-        for (struct mg_connection *c = mgr->conns; c != NULL; c = c->next) {
+
+        size_t message_len = strlen(broadcast_message);
+        struct mg_connection *c;
+        for (c = mgr.conns; c != NULL; c = c->next) {
             if (c->is_websocket) {
-                mg_ws_send(c, broadcast_message, strlen(broadcast_message), WEBSOCKET_OP_TEXT);
+                mg_ws_send(c, broadcast_message, message_len, WEBSOCKET_OP_BINARY);
             }
         }
     }
@@ -111,7 +118,7 @@ static void handle_get_announcement(struct mg_connection *c) {
     time_t expires_at;
 
     if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
-        mg_http_reply(c, 200, cors_headers, 
+        mg_http_reply(c, 200, cors_headers,
                       "{\"message\":\"%s\",\"expiresat\":%ld}", buffer, (long)expires_at);
     } else {
         mg_http_reply(c, 204, cors_headers, "");
@@ -137,9 +144,9 @@ static void handle_set_announcement(struct mg_connection *c, struct mg_http_mess
 
     int result = set_announcement(message, expires_at, token);
     if (result == 1) {
-        broadcast_announcement(&mgr);
+        broadcast_announcement();
     }
-    mg_http_reply(c, result == 1 ? 201 : 401, cors_headers, 
+    mg_http_reply(c, result == 1 ? 201 : 401, cors_headers,
                   result == 1 ? "{\"status\":\"success\"}" : "{\"status\":\"unauthorized\"}");
 }
 
@@ -151,23 +158,37 @@ static void handle_clear_announcement(struct mg_connection *c, struct mg_http_me
         free(token_str);
     }
     clear_announcement(token);
-    broadcast_announcement(&mgr);
+    broadcast_announcement();
     mg_http_reply(c, 200, cors_headers, "{\"status\":\"success\"}");
 }
 
 static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
     if (ev == MG_EV_WS_OPEN) {
         c->is_websocket = 1;
-        mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_TEXT);
-        
+        atomic_fetch_add(&connection_count, 1);
+        mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_BINARY);
+
         char buffer[MAX_MESSAGE_LENGTH];
         time_t expires_at;
         if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
             char announcement_message[512];
-            snprintf(announcement_message, sizeof(announcement_message), 
-                     "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}", 
+            snprintf(announcement_message, sizeof(announcement_message),
+                     "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
                      buffer, (long)expires_at);
-            mg_ws_send(c, announcement_message, strlen(announcement_message), WEBSOCKET_OP_TEXT);
+            mg_ws_send(c, announcement_message, strlen(announcement_message), WEBSOCKET_OP_BINARY);
+        }
+    } else if (ev == MG_EV_CLOSE) {
+        if (c->is_websocket) {
+            atomic_fetch_sub(&connection_count, 1);
+        }
+    } else if (ev == MG_EV_WS_MSG) {
+        struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
+        uint8_t msg_type = wm->flags & 0x0F;
+
+        if (msg_type == WEBSOCKET_OP_TEXT) {
+            // placeholder
+        } else if (msg_type == WEBSOCKET_OP_BINARY) {
+            // placeholder
         }
     }
 }
@@ -183,12 +204,11 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
             } else if (mg_strcmp(hm->method, mg_str("DELETE")) == 0) {
                 handle_clear_announcement(c, hm);
             } else if (mg_strcmp(hm->method, mg_str("OPTIONS")) == 0) {
-                // Handle preflight CORS requests
                 mg_http_reply(c, 200, cors_headers, "");
             } else {
                 mg_http_reply(c, 405, cors_headers, "{\"status\":\"method not allowed\"}");
             }
-        } else if (mg_strcmp(hm->uri, mg_str("/ws")) == 0 && 
+        } else if (mg_strcmp(hm->uri, mg_str("/ws")) == 0 &&
                    mg_strcmp(hm->method, mg_str("GET")) == 0) {
             mg_ws_upgrade(c, hm, NULL);
         } else {
@@ -211,8 +231,29 @@ int main(void) {
     mg_http_listen(&mgr, "http://0.0.0.0:5671", ev_handler, NULL);
     printf("Starting Announcement API server on port 5671\n");
 
-    for (;;) mg_mgr_poll(&mgr, 1000);
+    // Use epoll for efficient event handling
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        perror("epoll_create1");
+        return 1;
+    }
+
+    struct epoll_event events[EPOLL_MAX_EVENTS];
+
+    for (;;) {
+        int nfds = epoll_wait(epoll_fd, events, EPOLL_MAX_EVENTS, 1000);
+        if (nfds == -1) {
+            perror("epoll_wait");
+            break;
+        }
+
+        for (int i = 0; i < nfds; i++) {
+            struct mg_connection *c = (struct mg_connection *) events[i].data.ptr;
+            mg_mgr_poll(&mgr, 0);
+        }
+    }
 
     mg_mgr_free(&mgr);
+    close(epoll_fd);
     return 0;
 }
