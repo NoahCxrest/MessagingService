@@ -181,9 +181,24 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
     } else if (ev == MG_EV_CLOSE) {
         if (c->is_websocket) {
             atomic_fetch_sub(&connection_count, 1);
+            // no need to free anything here
         }
     } else if (ev == MG_EV_WS_MSG) {
        // Handle WebSocket message
+    }
+}
+
+
+static void cleanup_idle_connections(struct mg_mgr *mgr) {
+    struct mg_connection *c;
+    struct mg_connection *tmp;
+    time_t current_time = time(NULL);
+
+    for (c = mgr->conns; c != NULL; c = tmp) {
+        tmp = c->next;
+        if (c->is_websocket && current_time - c->last_activity_time > 60) {  // 60 seconds idle timeout
+            mg_close_conn(c);
+        }
     }
 }
 
@@ -236,8 +251,15 @@ int main() {
 
     printf("Starting Announcement API server on port 5671\n");
 
+    time_t last_cleanup = time(NULL);
     while (true) {
         mg_mgr_poll(&mgr, POLL_INTERVAL_MS);
+
+        // Perform cleanup every 2.5 minutes
+        if (time(NULL) - last_cleanup > 150) {
+            cleanup_idle_connections(&mgr);
+            last_cleanup = time(NULL);
+        }
     }
 
     mg_mgr_free(&mgr);
