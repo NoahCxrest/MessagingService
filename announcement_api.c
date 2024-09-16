@@ -6,9 +6,12 @@
 #include <stdatomic.h>
 #include "mongoose.h"
 
+// Constants
 #define MAX_MESSAGE_LENGTH 256
 #define AUTH_TOKEN_LENGTH 24
+#define POLL_INTERVAL_MS 50
 
+// Structs for Announcement and Flags
 typedef struct {
     unsigned int has_announcement : 1;
     unsigned int reserved : 7;
@@ -20,6 +23,7 @@ typedef struct {
     AnnouncementFlags flags;
 } __attribute__((packed)) Announcement;
 
+// Global variables
 static Announcement current_announcement = {.message = "", .expires_at = 0, .flags = {0, 0}};
 static atomic_flag spinlock = ATOMIC_FLAG_INIT;
 static atomic_int connection_count = 0;
@@ -29,9 +33,9 @@ const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
 static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0};
 static struct mg_mgr mgr;
 
+// Lock management functions
 static inline void acquire_lock(void) {
     while (atomic_flag_test_and_set(&spinlock)) {
-        // Spin-wait with a brief pause to avoid busy-waiting
         struct timespec ts = {0, 1000000}; // 1 ms
         nanosleep(&ts, NULL);
     }
@@ -41,6 +45,7 @@ static inline void release_lock(void) {
     atomic_flag_clear(&spinlock);
 }
 
+// Announcement management functions
 static inline bool get_announcement(char *buffer, size_t buffer_size, time_t *expires_at) {
     bool has_announcement;
     acquire_lock();
@@ -107,6 +112,7 @@ static void broadcast_announcement(void) {
     }
 }
 
+// HTTP request handlers
 static void handle_get_announcement(struct mg_connection *c) {
     char buffer[MAX_MESSAGE_LENGTH];
     time_t expires_at;
@@ -156,6 +162,7 @@ static void handle_clear_announcement(struct mg_connection *c, struct mg_http_me
     mg_http_reply(c, 200, cors_headers, "{\"status\":\"success\"}");
 }
 
+// WebSocket event handler
 static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
     if (ev == MG_EV_WS_OPEN) {
         c->is_websocket = 1;
@@ -176,10 +183,11 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
             atomic_fetch_sub(&connection_count, 1);
         }
     } else if (ev == MG_EV_WS_MSG) {
-       //yes yes
+       // Handle WebSocket message
     }
 }
 
+// Event handler for HTTP and WebSocket events
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     if (ev == MG_EV_HTTP_MSG) {
         struct mg_http_message *hm = (struct mg_http_message *) ev_data;
@@ -206,20 +214,30 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     }
 }
 
-int main(void) {
+// Main function
+int main() {
     const char *env_token = getenv("ANNOUNCEMENT_AUTH_TOKEN");
+
     if (!env_token || strlen(env_token) != AUTH_TOKEN_LENGTH) {
         fprintf(stderr, "Invalid or missing ANNOUNCEMENT_AUTH_TOKEN environment variable.\n");
         return 1;
     }
-    memcpy(auth_token, env_token, AUTH_TOKEN_LENGTH);
+    strncpy(auth_token, env_token, AUTH_TOKEN_LENGTH);
+    auth_token[AUTH_TOKEN_LENGTH] = '\0'; // Ensure null-termination
 
     mg_mgr_init(&mgr);
-    mg_http_listen(&mgr, "http://0.0.0.0:5671", ev_handler, NULL);
+
+    struct mg_connection *nc = mg_http_listen(&mgr, "http://0.0.0.0:5671", ev_handler, NULL);
+    if (nc == NULL) {
+        fprintf(stderr, "Failed to create listener.\n");
+        mg_mgr_free(&mgr);
+        return 1;
+    }
+
     printf("Starting Announcement API server on port 5671\n");
 
     while (true) {
-        mg_mgr_poll(&mgr, 1000);
+        mg_mgr_poll(&mgr, POLL_INTERVAL_MS);
     }
 
     mg_mgr_free(&mgr);
