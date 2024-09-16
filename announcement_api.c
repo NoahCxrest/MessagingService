@@ -42,6 +42,8 @@ static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0};
 static struct mg_mgr mgr;
 static Connection *connections = NULL;
 static size_t connections_size = 0;
+static time_t *connection_last_activity = NULL;
+static size_t connection_last_activity_size = 0;
 
 // Lock management functions
 static inline void acquire_lock(void) {
@@ -123,17 +125,17 @@ static void broadcast_announcement(void) {
 }
 
 // Connection management
-static void ensure_connection_capacity(size_t required_size) {
-    if (required_size > connections_size) {
+static void ensure_connection_last_activity_size(size_t required_size) {
+    if (required_size > connection_last_activity_size) {
         size_t new_size = required_size + 1000;  // Allocate extra space
-        Connection *new_array = realloc(connections, new_size * sizeof(Connection));
+        time_t *new_array = realloc(connection_last_activity, new_size * sizeof(time_t));
         if (new_array == NULL) {
-            fprintf(stderr, "Failed to resize connection array.\n");
+            fprintf(stderr, "Failed to resize connection last activity array.\n");
             exit(1);
         }
-        memset(new_array + connections_size, 0, (new_size - connections_size) * sizeof(Connection));
-        connections = new_array;
-        connections_size = new_size;
+        memset(new_array + connection_last_activity_size, 0, (new_size - connection_last_activity_size) * sizeof(time_t));
+        connection_last_activity = new_array;
+        connection_last_activity_size = new_size;
     }
 }
 
