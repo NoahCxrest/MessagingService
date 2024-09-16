@@ -32,6 +32,7 @@ typedef struct WebSocketConnection {
 
 // Function prototypes
 static void broadcast_to_websockets(const char *message, size_t message_len);
+static void broadcast_announcement(void);
 
 // Global variables
 static Announcement current_announcement = {.message = "", .expires_at = 0, .flags = {0, 0}};
@@ -44,7 +45,6 @@ static WebSocketConnection *ws_connections = NULL;
 const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
                            "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
                            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
-
 
 // Lock management functions
 static inline void acquire_lock(void) {
@@ -83,6 +83,9 @@ static inline int set_announcement(const char *message, time_t expires_at, const
     current_announcement.expires_at = expires_at;
     current_announcement.flags.has_announcement = 1;
     release_lock();
+
+    // Broadcast the new announcement immediately
+    broadcast_announcement();
     return 1;
 }
 
@@ -199,9 +202,6 @@ static void handle_set_announcement(struct mg_connection *c, struct mg_http_mess
     }
 
     int result = set_announcement(message, expires_at, token);
-    if (result == 1) {
-        broadcast_announcement();
-    }
     mg_http_reply(c, result == 1 ? 201 : 401, cors_headers,
                   result == 1 ? "{\"status\":\"success\"}" : "{\"status\":\"unauthorized\"}");
 }
@@ -214,7 +214,6 @@ static void handle_clear_announcement(struct mg_connection *c, struct mg_http_me
         free(token_str);
     }
     clear_announcement(token);
-    broadcast_announcement();
     mg_http_reply(c, 200, cors_headers, "{\"status\":\"success\"}");
 }
 
@@ -225,23 +224,14 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
         add_websocket_connection(c);
         mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_BINARY);
 
-        char buffer[MAX_MESSAGE_LENGTH];
-        time_t expires_at;
-        if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
-            char announcement_message[512];
-            int written = snprintf(announcement_message, sizeof(announcement_message),
-                     "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
-                     buffer, (long)expires_at);
-            if (written > 0 && written < sizeof(announcement_message)) {
-                mg_ws_send(c, announcement_message, written, WEBSOCKET_OP_BINARY);
-            }
-        }
+        // Send current announcement to the newly connected client
+        broadcast_announcement();
     } else if (ev == MG_EV_CLOSE) {
         if (c->is_websocket) {
             remove_websocket_connection(c);
         }
     } else if (ev == MG_EV_WS_MSG) {
-       // Handle WebSocket message
+       // Handle WebSocket message if needed
     }
 }
 
