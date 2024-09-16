@@ -32,6 +32,7 @@ const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
                            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
 static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0};
 static struct mg_mgr mgr;
+static time_t *connection_last_activity;
 
 // Lock management functions
 static inline void acquire_lock(void) {
@@ -169,6 +170,9 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
         atomic_fetch_add(&connection_count, 1);
         mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_BINARY);
 
+        // Initialize last activity time for this connection
+        connection_last_activity[c->id] = time(NULL);
+
         char buffer[MAX_MESSAGE_LENGTH];
         time_t expires_at;
         if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
@@ -181,13 +185,12 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
     } else if (ev == MG_EV_CLOSE) {
         if (c->is_websocket) {
             atomic_fetch_sub(&connection_count, 1);
-            // no need to free anything here
         }
     } else if (ev == MG_EV_WS_MSG) {
-       // Handle WebSocket message
+        // Update last activity time for this connection
+        connection_last_activity[c->id] = time(NULL);
     }
 }
-
 
 static void cleanup_idle_connections(struct mg_mgr *mgr) {
     struct mg_connection *c;
@@ -196,7 +199,7 @@ static void cleanup_idle_connections(struct mg_mgr *mgr) {
 
     for (c = mgr->conns; c != NULL; c = tmp) {
         tmp = c->next;
-        if (c->is_websocket && current_time - c->last_activity_time > 60) {  // 60 seconds idle timeout
+        if (c->is_websocket && current_time - connection_last_activity[c->id] > 60) {  // 60 seconds idle timeout
             mg_close_conn(c);
         }
     }
@@ -232,7 +235,6 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 // Main function
 int main() {
     const char *env_token = getenv("ANNOUNCEMENT_AUTH_TOKEN");
-
     if (!env_token || strlen(env_token) != AUTH_TOKEN_LENGTH) {
         fprintf(stderr, "Invalid or missing ANNOUNCEMENT_AUTH_TOKEN environment variable.\n");
         return 1;
@@ -242,9 +244,18 @@ int main() {
 
     mg_mgr_init(&mgr);
 
+    // Initialize the connection_last_activity array
+    connection_last_activity = calloc(mgr.next_id + 1000, sizeof(time_t));  // Allocate extra space for future connections
+    if (connection_last_activity == NULL) {
+        fprintf(stderr, "Failed to allocate memory for connection activity tracking.\n");
+        mg_mgr_free(&mgr);
+        return 1;
+    }
+
     struct mg_connection *nc = mg_http_listen(&mgr, "http://0.0.0.0:5671", ev_handler, NULL);
     if (nc == NULL) {
         fprintf(stderr, "Failed to create listener.\n");
+        free(connection_last_activity);
         mg_mgr_free(&mgr);
         return 1;
     }
@@ -260,8 +271,22 @@ int main() {
             cleanup_idle_connections(&mgr);
             last_cleanup = time(NULL);
         }
+
+        // Check if we need to resize the connection_last_activity array
+        if (mgr.next_id >= mgr.next_id + 1000) {
+            size_t new_size = mgr.next_id + 1000;
+            time_t *new_array = realloc(connection_last_activity, new_size * sizeof(time_t));
+            if (new_array == NULL) {
+                fprintf(stderr, "Failed to resize connection activity tracking array.\n");
+                break;  // Exit the loop if we can't resize
+            }
+            connection_last_activity = new_array;
+            memset(connection_last_activity + mgr.next_id, 0, 1000 * sizeof(time_t));  // Initialize new elements to 0
+        }
     }
 
+    // Cleanup
+    free(connection_last_activity);
     mg_mgr_free(&mgr);
     return 0;
 }
