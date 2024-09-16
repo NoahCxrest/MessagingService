@@ -6,7 +6,6 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include "mongoose.h"
-#include <stdint.h>
 
 // Constants
 #define MAX_MESSAGE_LENGTH 256
@@ -47,7 +46,6 @@ static size_t connections_size = 0;
 // Lock management functions
 static inline void acquire_lock(void) {
     while (atomic_flag_test_and_set_explicit(&spinlock, memory_order_acquire)) {
-        // Use a short spin before yielding to reduce context switches
         for (int i = 0; i < 1000; i++) {
             sched_yield();
         }
@@ -188,15 +186,12 @@ static void handle_clear_announcement(struct mg_connection *c, struct mg_http_me
 
 void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
     if (ev == MG_EV_WS_OPEN) {
-        // WebSocket connection is established
         connections[c->id].is_websocket = true;
         atomic_fetch_add(&connection_count, 1);
         mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_TEXT);
 
-        // Initialize last activity time for this connection
         connections[c->id].last_activity = time(NULL);
 
-        // Send current announcement if any
         char buffer[MAX_MESSAGE_LENGTH];
         time_t expires_at;
         if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
@@ -207,35 +202,28 @@ void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
             mg_ws_send(c, announcement_message, strlen(announcement_message), WEBSOCKET_OP_TEXT);
         }
     } else if (ev == MG_EV_CLOSE) {
-        // WebSocket connection is closed
         if (connections[c->id].is_websocket) {
             atomic_fetch_sub(&connection_count, 1);
             connections[c->id].is_websocket = false;
         }
     } else if (ev == MG_EV_WS_MSG) {
-        // WebSocket message received
         struct mg_ws_message *wm = (struct mg_ws_message *)ev_data;
-        uint8_t msgtype = wm->flags & 0x0F; // Extract message type
+        uint8_t msgtype = wm->flags & 0x0F;
 
         if (msgtype == WEBSOCKET_OP_TEXT) {
-            // Handle text message
             struct mg_str data = wm->data;
             char buffer[MAX_MESSAGE_LENGTH];
             snprintf(buffer, sizeof(buffer), "{\"type\":\"message_received\",\"message\":\"%.*s\"}", (int)data.len, data.buf);
             mg_ws_send(c, buffer, strlen(buffer), WEBSOCKET_OP_TEXT);
 
-            // Check if the message is a heartbeat
             int token_len;
             int result = mg_json_get(data, "$.type", &token_len);
             if (result > 0) {
                 const char *type_token = data.buf + result;
                 if (strncmp(type_token, "heartbeat", token_len) == 0) {
-                    // Update last activity time for this connection
                     connections[c->id].last_activity = time(NULL);
                 }
             }
-        } else if (msgtype == WEBSOCKET_OP_BINARY) {
-            // Handle binary message if necessary
         }
     }
 }
@@ -289,12 +277,11 @@ int main() {
         return 1;
     }
     strncpy(auth_token, env_token, AUTH_TOKEN_LENGTH);
-    auth_token[AUTH_TOKEN_LENGTH] = '\0'; // Ensure null-termination
+    auth_token[AUTH_TOKEN_LENGTH] = '\0';
 
     mg_mgr_init(&mgr);
 
-    // Initialize the connections array
-    ensure_connection_capacity(1000);  // Start with space for 1000 connections
+    ensure_connection_capacity(1000);
 
     struct mg_connection *nc = mg_http_listen(&mgr, "http://0.0.0.0:5671", ev_handler, NULL);
     if (nc == NULL) {
@@ -310,26 +297,14 @@ int main() {
     while (true) {
         mg_mgr_poll(&mgr, POLL_INTERVAL_MS);
 
-        // Perform cleanup every CLEANUP_INTERVAL_SECONDS
         if (time(NULL) - last_cleanup > CLEANUP_INTERVAL_SECONDS) {
             cleanup_idle_connections(&mgr);
             last_cleanup = time(NULL);
         }
 
-        // Ensure we have enough space in the connections array
         ensure_connection_capacity(mgr.nextid + 1);
-
-        // Example of fixing the mg_json_get call
-        struct mg_str data = mg_str("{\"type\":\"example\"}"); // Placeholder
-        int token_len;
-        int result = mg_json_get(data, "$.type", &token_len);
-        if (result > 0) {
-            const char *type_token = data.buf + result;
-            // Example
-        }
     }
 
-    // Cleanup
     free(connections);
     mg_mgr_free(&mgr);
     return 0;
