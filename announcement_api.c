@@ -49,9 +49,8 @@ static inline void acquire_lock(void) {
     while (atomic_flag_test_and_set_explicit(&spinlock, memory_order_acquire)) {
         // Use a short spin before yielding to reduce context switches
         for (int i = 0; i < 1000; i++) {
-            __asm__ volatile("pause" ::: "memory");
+            sched_yield();
         }
-        sched_yield();
     }
 }
 
@@ -226,20 +225,20 @@ void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
             mg_ws_send(c, buffer, strlen(buffer), WEBSOCKET_OP_TEXT);
 
             // Check if the message is a heartbeat
-            struct mg_str type_token;
-            if (mg_json_get(data, "$.type", &type_token) == NULL) {
-                type_token.len = 0;
-            }
-            if (type_token.len > 0 && mg_strcmp(type_token, mg_str("heartbeat")) == 0) {
-                // Update last activity time for this connection
-                connections[c->id].last_activity = time(NULL);
+            int token_len;
+            int result = mg_json_get(data, "$.type", &token_len);
+            if (result > 0) {
+                const char *type_token = data.buf + result;
+                if (strncmp(type_token, "heartbeat", token_len) == 0) {
+                    // Update last activity time for this connection
+                    connections[c->id].last_activity = time(NULL);
+                }
             }
         } else if (msgtype == WEBSOCKET_OP_BINARY) {
             // Handle binary message if necessary
         }
     }
 }
-
 
 static void cleanup_idle_connections(struct mg_mgr *mgr) {
     struct mg_connection *c;
@@ -319,6 +318,15 @@ int main() {
 
         // Ensure we have enough space in the connections array
         ensure_connection_capacity(mgr.nextid + 1);
+
+        // Example of fixing the mg_json_get call
+        struct mg_str data = mg_str("{\"type\":\"example\"}"); // Placeholder
+        int token_len;
+        int result = mg_json_get(data, "$.type", &token_len);
+        if (result > 0) {
+            const char *type_token = data.buf + result;
+            // Example
+        }
     }
 
     // Cleanup
