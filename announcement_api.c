@@ -32,13 +32,6 @@ typedef struct {
     bool is_websocket;
 } Connection;
 
-struct connection_info {
-    bool is_websocket;
-    time_t last_activity;
-};
-
-extern struct connection_info connections[];
-
 // Global variables
 static Announcement current_announcement = {.message = "", .expires_at = 0, .flags = {0, 0}};
 static atomic_flag spinlock = ATOMIC_FLAG_INIT;
@@ -242,7 +235,7 @@ void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
                 connections[c->id].last_activity = time(NULL);
             }
         } else if (msgtype == WEBSOCKET_OP_BINARY) {
-            // not needed
+            // Handle binary message if necessary
         }
     }
 }
