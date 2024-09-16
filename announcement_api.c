@@ -32,7 +32,8 @@ const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
                            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
 static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0};
 static struct mg_mgr mgr;
-static time_t *connection_last_activity;
+static time_t *connection_last_activity = NULL;
+static size_t connection_last_activity_size = 0;
 
 // Lock management functions
 static inline void acquire_lock(void) {
@@ -163,6 +164,20 @@ static void handle_clear_announcement(struct mg_connection *c, struct mg_http_me
     mg_http_reply(c, 200, cors_headers, "{\"status\":\"success\"}");
 }
 
+static void ensure_connection_last_activity_size(size_t required_size) {
+    if (required_size > connection_last_activity_size) {
+        size_t new_size = required_size + 1000;  // Allocate extra space
+        time_t *new_array = realloc(connection_last_activity, new_size * sizeof(time_t));
+        if (new_array == NULL) {
+            fprintf(stderr, "Failed to resize connection activity tracking array.\n");
+            exit(1);
+        }
+        memset(new_array + connection_last_activity_size, 0, (new_size - connection_last_activity_size) * sizeof(time_t));
+        connection_last_activity = new_array;
+        connection_last_activity_size = new_size;
+    }
+}
+
 // WebSocket event handler
 static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
     if (ev == MG_EV_WS_OPEN) {
@@ -171,6 +186,7 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
         mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_BINARY);
 
         // Initialize last activity time for this connection
+        ensure_connection_last_activity_size(c->id + 1);
         connection_last_activity[c->id] = time(NULL);
 
         char buffer[MAX_MESSAGE_LENGTH];
@@ -188,6 +204,7 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
         }
     } else if (ev == MG_EV_WS_MSG) {
         // Update last activity time for this connection
+        ensure_connection_last_activity_size(c->id + 1);
         connection_last_activity[c->id] = time(NULL);
     }
 }
@@ -235,6 +252,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 // Main function
 int main() {
     const char *env_token = getenv("ANNOUNCEMENT_AUTH_TOKEN");
+
     if (!env_token || strlen(env_token) != AUTH_TOKEN_LENGTH) {
         fprintf(stderr, "Invalid or missing ANNOUNCEMENT_AUTH_TOKEN environment variable.\n");
         return 1;
@@ -245,12 +263,7 @@ int main() {
     mg_mgr_init(&mgr);
 
     // Initialize the connection_last_activity array
-    connection_last_activity = calloc(mgr.next_id + 1000, sizeof(time_t));  // Allocate extra space for future connections
-    if (connection_last_activity == NULL) {
-        fprintf(stderr, "Failed to allocate memory for connection activity tracking.\n");
-        mg_mgr_free(&mgr);
-        return 1;
-    }
+    ensure_connection_last_activity_size(1000);  // Start with space for 1000 connections
 
     struct mg_connection *nc = mg_http_listen(&mgr, "http://0.0.0.0:5671", ev_handler, NULL);
     if (nc == NULL) {
@@ -272,17 +285,8 @@ int main() {
             last_cleanup = time(NULL);
         }
 
-        // Check if we need to resize the connection_last_activity array
-        if (mgr.next_id >= mgr.next_id + 1000) {
-            size_t new_size = mgr.next_id + 1000;
-            time_t *new_array = realloc(connection_last_activity, new_size * sizeof(time_t));
-            if (new_array == NULL) {
-                fprintf(stderr, "Failed to resize connection activity tracking array.\n");
-                break;  // Exit the loop if we can't resize
-            }
-            connection_last_activity = new_array;
-            memset(connection_last_activity + mgr.next_id, 0, 1000 * sizeof(time_t));  // Initialize new elements to 0
-        }
+        // Ensure we have enough space in the connection_last_activity array
+        ensure_connection_last_activity_size(mgr.nextid + 1);
     }
 
     // Cleanup
