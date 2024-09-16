@@ -6,6 +6,7 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include "mongoose.h"
+#include <stdint.h>
 
 // Constants
 #define MAX_MESSAGE_LENGTH 256
@@ -31,6 +32,13 @@ typedef struct {
     bool is_websocket;
 } Connection;
 
+struct connection_info {
+    bool is_websocket;
+    time_t last_activity;
+};
+
+extern struct connection_info connections[];
+
 // Global variables
 static Announcement current_announcement = {.message = "", .expires_at = 0, .flags = {0, 0}};
 static atomic_flag spinlock = ATOMIC_FLAG_INIT;
@@ -42,8 +50,6 @@ static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0};
 static struct mg_mgr mgr;
 static Connection *connections = NULL;
 static size_t connections_size = 0;
-static time_t *connection_last_activity = NULL;
-static size_t connection_last_activity_size = 0;
 
 // Lock management functions
 static inline void acquire_lock(void) {
@@ -125,17 +131,17 @@ static void broadcast_announcement(void) {
 }
 
 // Connection management
-static void ensure_connection_last_activity_size(size_t required_size) {
-    if (required_size > connection_last_activity_size) {
+static void ensure_connection_capacity(size_t required_size) {
+    if (required_size > connections_size) {
         size_t new_size = required_size + 1000;  // Allocate extra space
-        time_t *new_array = realloc(connection_last_activity, new_size * sizeof(time_t));
+        Connection *new_array = realloc(connections, new_size * sizeof(Connection));
         if (new_array == NULL) {
-            fprintf(stderr, "Failed to resize connection last activity array.\n");
+            fprintf(stderr, "Failed to resize connection array.\n");
             exit(1);
         }
-        memset(new_array + connection_last_activity_size, 0, (new_size - connection_last_activity_size) * sizeof(time_t));
-        connection_last_activity = new_array;
-        connection_last_activity_size = new_size;
+        memset(new_array + connections_size, 0, (new_size - connections_size) * sizeof(Connection));
+        connections = new_array;
+        connections_size = new_size;
     }
 }
 
@@ -188,17 +194,15 @@ static void handle_clear_announcement(struct mg_connection *c, struct mg_http_me
     mg_http_reply(c, 200, cors_headers, "{\"status\":\"success\"}");
 }
 
-// WebSocket event handler
-static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
+void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
     if (ev == MG_EV_WS_OPEN) {
         // WebSocket connection is established
-        c->is_websocket = 1;
+        connections[c->id].is_websocket = true;
         atomic_fetch_add(&connection_count, 1);
-        mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_BINARY);
+        mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_TEXT);
 
         // Initialize last activity time for this connection
-        ensure_connection_last_activity_size(c->id + 1);
-        connection_last_activity[c->id] = time(NULL);
+        connections[c->id].last_activity = time(NULL);
 
         // Send current announcement if any
         char buffer[MAX_MESSAGE_LENGTH];
@@ -208,38 +212,41 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
             snprintf(announcement_message, sizeof(announcement_message),
                      "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
                      buffer, (long)expires_at);
-            mg_ws_send(c, announcement_message, strlen(announcement_message), WEBSOCKET_OP_BINARY);
+            mg_ws_send(c, announcement_message, strlen(announcement_message), WEBSOCKET_OP_TEXT);
         }
     } else if (ev == MG_EV_CLOSE) {
         // WebSocket connection is closed
-        if (c->is_websocket) {
+        if (connections[c->id].is_websocket) {
             atomic_fetch_sub(&connection_count, 1);
+            connections[c->id].is_websocket = false;
         }
     } else if (ev == MG_EV_WS_MSG) {
         // WebSocket message received
-        struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
+        struct mg_ws_message *wm = (struct mg_ws_message *)ev_data;
+        uint8_t msgtype = wm->flags & 0x0F; // Extract message type
 
-        // Parse JSON message
-        struct json_token type_token = JSON_INVALID_TOKEN;
-        json_scanf(wm->data.ptr, wm->data.len, "{type:%T}", &type_token);
+        if (msgtype == WEBSOCKET_OP_TEXT) {
+            // Handle text message
+            struct mg_str data = wm->data;
+            char buffer[MAX_MESSAGE_LENGTH];
+            snprintf(buffer, sizeof(buffer), "{\"type\":\"message_received\",\"message\":\"%.*s\"}", (int)data.len, data.buf);
+            mg_ws_send(c, buffer, strlen(buffer), WEBSOCKET_OP_TEXT);
 
-        if (type_token.len > 0) {
-            // Check if the message type is "heartbeat"
-            char *type_str = mg_json_get_str(wm->data, "$.type");
-            if (type_str && strcmp(type_str, "heartbeat") == 0) {
-                ensure_connection_last_activity_size(c->id + 1);
-                connection_last_activity[c->id] = time(NULL);
-                free(type_str);
-            } else {
-                // Handle other types of messages
-                char buffer[MAX_MESSAGE_LENGTH];
-                snprintf(buffer, sizeof(buffer), "{\"type\":\"message_received\",\"message\":\"%.*s\"}", (int) wm->data.len, wm->data.ptr);
-                mg_ws_send(c, buffer, strlen(buffer), WEBSOCKET_OP_BINARY);
-                free(type_str);
+            // Check if the message is a heartbeat
+            struct mg_str type_token;
+            if (mg_json_get(data, "$.type", &type_token) == NULL) {
+                type_token.len = 0;
             }
+            if (type_token.len > 0 && mg_strcmp(type_token, mg_str("heartbeat")) == 0) {
+                // Update last activity time for this connection
+                connections[c->id].last_activity = time(NULL);
+            }
+        } else if (msgtype == WEBSOCKET_OP_BINARY) {
+            // not needed
         }
     }
 }
+
 
 static void cleanup_idle_connections(struct mg_mgr *mgr) {
     struct mg_connection *c;
