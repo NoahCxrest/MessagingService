@@ -203,7 +203,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
             } else {
                 mg_http_reply(c, 405, cors_headers, "{\"status\":\"method not allowed\"}");
             }
-        } else if (mg_strcmp(hm->uri, mg_str("/ws")) == 0 &&
+        } else if (mg_strcmp(hm->uri, mg_str("/stream")) == 0 &&
                    mg_strcmp(hm->method, mg_str("GET")) == 0) {
             mg_ws_upgrade(c, hm, NULL);
         } else {
