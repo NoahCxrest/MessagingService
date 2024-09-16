@@ -30,6 +30,9 @@ typedef struct WebSocketConnection {
     struct WebSocketConnection *next;
 } WebSocketConnection;
 
+// Function prototypes
+static void broadcast_to_websockets(const char *message, size_t message_len);
+
 // Global variables
 static Announcement current_announcement = {.message = "", .expires_at = 0, .flags = {0, 0}};
 static atomic_flag spinlock = ATOMIC_FLAG_INIT;
@@ -41,6 +44,7 @@ static WebSocketConnection *ws_connections = NULL;
 const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
                            "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
                            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+
 
 // Lock management functions
 static inline void acquire_lock(void) {
