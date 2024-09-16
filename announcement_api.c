@@ -203,11 +203,18 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
             atomic_fetch_sub(&connection_count, 1);
         }
     } else if (ev == MG_EV_WS_MSG) {
-        // Update last activity time for this connection
-        ensure_connection_last_activity_size(c->id + 1);
-        connection_last_activity[c->id] = time(NULL);
+        struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
+        // Check if the received message is a heartbeat
+        if (strncmp(wm->data.ptr, "heartbeat", wm->data.len) == 0) {
+            // Update last activity time for this connection
+            ensure_connection_last_activity_size(c->id + 1);
+            connection_last_activity[c->id] = time(NULL);
+        } else {
+            // No need to process further
+        }
     }
 }
+
 
 static void cleanup_idle_connections(struct mg_mgr *mgr) {
     struct mg_connection *c;
@@ -216,7 +223,7 @@ static void cleanup_idle_connections(struct mg_mgr *mgr) {
 
     for (c = mgr->conns; c != NULL; c = tmp) {
         tmp = c->next;
-        if (c->is_websocket && current_time - connection_last_activity[c->id] > 60) {  // 60 seconds idle timeout
+        if (c->is_websocket && current_time - connection_last_activity[c->id] > 180) {  // 180 seconds (3 minutes)
             mg_close_conn(c);
         }
     }
