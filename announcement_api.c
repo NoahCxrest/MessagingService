@@ -225,15 +225,17 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
 
         if (type_token.len > 0) {
             // Check if the message type is "heartbeat"
-            if (strncmp(type_token.ptr, "heartbeat", type_token.len) == 0) {
-                // Update last activity time for this connection
+            char *type_str = mg_json_get_str(wm->data, "$.type");
+            if (type_str && strcmp(type_str, "heartbeat") == 0) {
                 ensure_connection_last_activity_size(c->id + 1);
                 connection_last_activity[c->id] = time(NULL);
+                free(type_str);
             } else {
-                // Handle other message types (e.g., custom actions)
+                // Handle other types of messages
                 char buffer[MAX_MESSAGE_LENGTH];
                 snprintf(buffer, sizeof(buffer), "{\"type\":\"message_received\",\"message\":\"%.*s\"}", (int) wm->data.len, wm->data.ptr);
                 mg_ws_send(c, buffer, strlen(buffer), WEBSOCKET_OP_BINARY);
+                free(type_str);
             }
         }
     }
