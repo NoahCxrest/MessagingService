@@ -10,6 +10,7 @@
 #define MAX_MESSAGE_LENGTH 256
 #define AUTH_TOKEN_LENGTH 24
 #define POLL_INTERVAL_MS 50
+#define MAX_CONNECTIONS 10000
 
 // Structs for Announcement and Flags
 typedef struct {
@@ -23,15 +24,23 @@ typedef struct {
     AnnouncementFlags flags;
 } __attribute__((packed)) Announcement;
 
+// Struct for WebSocket connection management
+typedef struct WebSocketConnection {
+    struct mg_connection *conn;
+    struct WebSocketConnection *next;
+} WebSocketConnection;
+
 // Global variables
 static Announcement current_announcement = {.message = "", .expires_at = 0, .flags = {0, 0}};
 static atomic_flag spinlock = ATOMIC_FLAG_INIT;
 static atomic_int connection_count = 0;
+static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0};
+static struct mg_mgr mgr;
+static WebSocketConnection *ws_connections = NULL;
+
 const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
                            "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
                            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
-static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0};
-static struct mg_mgr mgr;
 
 // Lock management functions
 static inline void acquire_lock(void) {
@@ -82,15 +91,62 @@ static inline void clear_announcement(const char *token) {
         release_lock();
 
         char broadcast_message[512];
-        snprintf(broadcast_message, sizeof(broadcast_message), "{\"type\":\"announcement_cleared\"}");
-
-        size_t message_len = strlen(broadcast_message);
-        for (struct mg_connection *c = mgr.conns; c != NULL; c = c->next) {
-            if (c->is_websocket) {
-                mg_ws_send(c, broadcast_message, message_len, WEBSOCKET_OP_BINARY);
-            }
+        int written = snprintf(broadcast_message, sizeof(broadcast_message), "{\"type\":\"announcement_cleared\"}");
+        if (written > 0 && written < sizeof(broadcast_message)) {
+            broadcast_to_websockets(broadcast_message, written);
         }
     }
+}
+
+// WebSocket connection management functions
+static void add_websocket_connection(struct mg_connection *c) {
+    WebSocketConnection *new_conn = malloc(sizeof(WebSocketConnection));
+    if (new_conn == NULL) {
+        // Handle memory allocation failure
+        return;
+    }
+    new_conn->conn = c;
+    new_conn->next = ws_connections;
+    ws_connections = new_conn;
+    atomic_fetch_add(&connection_count, 1);
+}
+
+static void remove_websocket_connection(struct mg_connection *c) {
+    WebSocketConnection *current = ws_connections;
+    WebSocketConnection *prev = NULL;
+
+    while (current != NULL) {
+        if (current->conn == c) {
+            if (prev == NULL) {
+                ws_connections = current->next;
+            } else {
+                prev->next = current->next;
+            }
+            free(current);
+            atomic_fetch_sub(&connection_count, 1);
+            return;
+        }
+        prev = current;
+        current = current->next;
+    }
+}
+
+static void broadcast_to_websockets(const char *message, size_t message_len) {
+    WebSocketConnection *current = ws_connections;
+    while (current != NULL) {
+        mg_ws_send(current->conn, message, message_len, WEBSOCKET_OP_BINARY);
+        current = current->next;
+    }
+}
+
+static void cleanup_websocket_connections() {
+    WebSocketConnection *current = ws_connections;
+    while (current != NULL) {
+        WebSocketConnection *next = current->next;
+        free(current);
+        current = next;
+    }
+    ws_connections = NULL;
 }
 
 static void broadcast_announcement(void) {
@@ -99,15 +155,11 @@ static void broadcast_announcement(void) {
 
     if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
         char broadcast_message[512];
-        snprintf(broadcast_message, sizeof(broadcast_message),
+        int written = snprintf(broadcast_message, sizeof(broadcast_message),
                  "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
                  buffer, (long)expires_at);
-
-        size_t message_len = strlen(broadcast_message);
-        for (struct mg_connection *c = mgr.conns; c != NULL; c = c->next) {
-            if (c->is_websocket) {
-                mg_ws_send(c, broadcast_message, message_len, WEBSOCKET_OP_BINARY);
-            }
+        if (written > 0 && written < sizeof(broadcast_message)) {
+            broadcast_to_websockets(broadcast_message, written);
         }
     }
 }
@@ -166,21 +218,23 @@ static void handle_clear_announcement(struct mg_connection *c, struct mg_http_me
 static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
     if (ev == MG_EV_WS_OPEN) {
         c->is_websocket = 1;
-        atomic_fetch_add(&connection_count, 1);
+        add_websocket_connection(c);
         mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_BINARY);
 
         char buffer[MAX_MESSAGE_LENGTH];
         time_t expires_at;
         if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
             char announcement_message[512];
-            snprintf(announcement_message, sizeof(announcement_message),
+            int written = snprintf(announcement_message, sizeof(announcement_message),
                      "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
                      buffer, (long)expires_at);
-            mg_ws_send(c, announcement_message, strlen(announcement_message), WEBSOCKET_OP_BINARY);
+            if (written > 0 && written < sizeof(announcement_message)) {
+                mg_ws_send(c, announcement_message, written, WEBSOCKET_OP_BINARY);
+            }
         }
     } else if (ev == MG_EV_CLOSE) {
         if (c->is_websocket) {
-            atomic_fetch_sub(&connection_count, 1);
+            remove_websocket_connection(c);
         }
     } else if (ev == MG_EV_WS_MSG) {
        // Handle WebSocket message
@@ -189,7 +243,13 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
 
 // Event handler for HTTP and WebSocket events
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
-    if (ev == MG_EV_HTTP_MSG) {
+    if (ev == MG_EV_ACCEPT) {
+        if (atomic_load(&connection_count) >= MAX_CONNECTIONS) {
+            // Too many connections, close this one
+            c->is_draining = 1;
+            return;
+        }
+    } else if (ev == MG_EV_HTTP_MSG) {
         struct mg_http_message *hm = (struct mg_http_message *) ev_data;
         if (mg_strcmp(hm->uri, mg_str("/announcement")) == 0) {
             if (mg_strcmp(hm->method, mg_str("GET")) == 0) {
@@ -240,6 +300,7 @@ int main() {
         mg_mgr_poll(&mgr, POLL_INTERVAL_MS);
     }
 
+    cleanup_websocket_connections();
     mg_mgr_free(&mgr);
     return 0;
 }
