@@ -10,8 +10,10 @@
 #define MAX_MESSAGE_LENGTH 256
 #define AUTH_TOKEN_LENGTH 24
 #define POLL_INTERVAL_MS 50
+#define CLEANUP_INTERVAL_SECONDS 150
+#define IDLE_TIMEOUT_SECONDS 180
 
-// Structs for Announcement and Flags
+// Structs for Announcement and Connection
 typedef struct {
     unsigned int has_announcement : 1;
     unsigned int reserved : 7;
@@ -23,28 +25,36 @@ typedef struct {
     AnnouncementFlags flags;
 } __attribute__((packed)) Announcement;
 
+typedef struct {
+    time_t last_activity;
+    bool is_websocket;
+} Connection;
+
 // Global variables
 static Announcement current_announcement = {.message = "", .expires_at = 0, .flags = {0, 0}};
 static atomic_flag spinlock = ATOMIC_FLAG_INIT;
 static atomic_int connection_count = 0;
-const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
-                           "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
-                           "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+static const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
+                                  "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
+                                  "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
 static char auth_token[AUTH_TOKEN_LENGTH + 1] = {0};
 static struct mg_mgr mgr;
-static time_t *connection_last_activity = NULL;
-static size_t connection_last_activity_size = 0;
+static Connection *connections = NULL;
+static size_t connections_size = 0;
 
 // Lock management functions
 static inline void acquire_lock(void) {
-    while (atomic_flag_test_and_set(&spinlock)) {
-        struct timespec ts = {0, 1000000}; // 1 ms
-        nanosleep(&ts, NULL);
+    while (atomic_flag_test_and_set_explicit(&spinlock, memory_order_acquire)) {
+        // Use a short spin before yielding to reduce context switches
+        for (int i = 0; i < 1000; i++) {
+            __asm__ volatile("pause" ::: "memory");
+        }
+        sched_yield();
     }
 }
 
 static inline void release_lock(void) {
-    atomic_flag_clear(&spinlock);
+    atomic_flag_clear_explicit(&spinlock, memory_order_release);
 }
 
 // Announcement management functions
@@ -83,13 +93,11 @@ static inline void clear_announcement(const char *token) {
         current_announcement.flags.has_announcement = 0;
         release_lock();
 
-        char broadcast_message[512];
-        snprintf(broadcast_message, sizeof(broadcast_message), "{\"type\":\"announcement_cleared\"}");
-
+        const char *broadcast_message = "{\"type\":\"announcement_cleared\"}";
         size_t message_len = strlen(broadcast_message);
         for (struct mg_connection *c = mgr.conns; c != NULL; c = c->next) {
-            if (c->is_websocket) {
-                mg_ws_send(c, broadcast_message, message_len, WEBSOCKET_OP_BINARY);
+            if (connections[c->id].is_websocket) {
+                mg_ws_send(c, broadcast_message, message_len, WEBSOCKET_OP_TEXT);
             }
         }
     }
@@ -101,16 +109,30 @@ static void broadcast_announcement(void) {
 
     if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
         char broadcast_message[512];
-        snprintf(broadcast_message, sizeof(broadcast_message),
-                 "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
-                 buffer, (long)expires_at);
+        int len = snprintf(broadcast_message, sizeof(broadcast_message),
+                           "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
+                           buffer, (long)expires_at);
 
-        size_t message_len = strlen(broadcast_message);
         for (struct mg_connection *c = mgr.conns; c != NULL; c = c->next) {
-            if (c->is_websocket) {
-                mg_ws_send(c, broadcast_message, message_len, WEBSOCKET_OP_BINARY);
+            if (connections[c->id].is_websocket) {
+                mg_ws_send(c, broadcast_message, len, WEBSOCKET_OP_TEXT);
             }
         }
+    }
+}
+
+// Connection management
+static void ensure_connection_capacity(size_t required_size) {
+    if (required_size > connections_size) {
+        size_t new_size = required_size + 1000;  // Allocate extra space
+        Connection *new_array = realloc(connections, new_size * sizeof(Connection));
+        if (new_array == NULL) {
+            fprintf(stderr, "Failed to resize connection array.\n");
+            exit(1);
+        }
+        memset(new_array + connections_size, 0, (new_size - connections_size) * sizeof(Connection));
+        connections = new_array;
+        connections_size = new_size;
     }
 }
 
@@ -160,61 +182,50 @@ static void handle_clear_announcement(struct mg_connection *c, struct mg_http_me
         free(token_str);
     }
     clear_announcement(token);
-    broadcast_announcement();
     mg_http_reply(c, 200, cors_headers, "{\"status\":\"success\"}");
-}
-
-static void ensure_connection_last_activity_size(size_t required_size) {
-    if (required_size > connection_last_activity_size) {
-        size_t new_size = required_size + 1000;  // Allocate extra space
-        time_t *new_array = realloc(connection_last_activity, new_size * sizeof(time_t));
-        if (new_array == NULL) {
-            fprintf(stderr, "Failed to resize connection activity tracking array.\n");
-            exit(1);
-        }
-        memset(new_array + connection_last_activity_size, 0, (new_size - connection_last_activity_size) * sizeof(time_t));
-        connection_last_activity = new_array;
-        connection_last_activity_size = new_size;
-    }
 }
 
 // WebSocket event handler
 static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
-    if (ev == MG_EV_WS_OPEN) {
-        c->is_websocket = 1;
-        atomic_fetch_add(&connection_count, 1);
-        mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_BINARY);
+    ensure_connection_capacity(c->id + 1);
 
-        // Initialize last activity time for this connection
-        ensure_connection_last_activity_size(c->id + 1);
-        connection_last_activity[c->id] = time(NULL);
+    switch (ev) {
+        case MG_EV_WS_OPEN:
+            connections[c->id].is_websocket = true;
+            connections[c->id].last_activity = time(NULL);
+            atomic_fetch_add(&connection_count, 1);
+            mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_TEXT);
 
-        char buffer[MAX_MESSAGE_LENGTH];
-        time_t expires_at;
-        if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
-            char announcement_message[512];
-            snprintf(announcement_message, sizeof(announcement_message),
-                     "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
-                     buffer, (long)expires_at);
-            mg_ws_send(c, announcement_message, strlen(announcement_message), WEBSOCKET_OP_BINARY);
+            char buffer[MAX_MESSAGE_LENGTH];
+            time_t expires_at;
+            if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
+                char announcement_message[512];
+                int len = snprintf(announcement_message, sizeof(announcement_message),
+                                   "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
+                                   buffer, (long)expires_at);
+                mg_ws_send(c, announcement_message, len, WEBSOCKET_OP_TEXT);
+            }
+            break;
+
+        case MG_EV_CLOSE:
+            if (connections[c->id].is_websocket) {
+                atomic_fetch_sub(&connection_count, 1);
+                connections[c->id].is_websocket = false;
+            }
+            break;
+
+        case MG_EV_WS_MSG: {
+            struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
+            if (mg_json_get(wm->data, "$.type") != NULL) {
+                connections[c->id].last_activity = time(NULL);
+            }
+            break;
         }
-    } else if (ev == MG_EV_CLOSE) {
-        if (c->is_websocket) {
-            atomic_fetch_sub(&connection_count, 1);
-        }
-    } else if (ev == MG_EV_WS_MSG) {
-        struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
-        // Check if the received message is a heartbeat
-        if (strncmp(wm->data.ptr, "heartbeat", wm->data.len) == 0) {
-            // Update last activity time for this connection
-            ensure_connection_last_activity_size(c->id + 1);
-            connection_last_activity[c->id] = time(NULL);
-        } else {
-            // No need to process further
-        }
+
+        default:
+            break;
     }
 }
-
 
 static void cleanup_idle_connections(struct mg_mgr *mgr) {
     struct mg_connection *c;
@@ -223,7 +234,8 @@ static void cleanup_idle_connections(struct mg_mgr *mgr) {
 
     for (c = mgr->conns; c != NULL; c = tmp) {
         tmp = c->next;
-        if (c->is_websocket && current_time - connection_last_activity[c->id] > 180) {  // 180 seconds (3 minutes)
+        if (connections[c->id].is_websocket && current_time - connections[c->id].last_activity > IDLE_TIMEOUT_SECONDS) {
+            mg_ws_send(c, "{\"type\":\"timeout\"}", 18, WEBSOCKET_OP_TEXT);
             mg_close_conn(c);
         }
     }
@@ -251,12 +263,11 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         } else {
             mg_http_reply(c, 404, cors_headers, "{\"status\":\"not found\"}");
         }
-    } else if (ev == MG_EV_WS_MSG) {
+    } else if (ev == MG_EV_WS_OPEN || ev == MG_EV_WS_MSG || ev == MG_EV_CLOSE) {
         handle_websocket(c, ev, ev_data);
     }
 }
 
-// Main function
 int main() {
     const char *env_token = getenv("ANNOUNCEMENT_AUTH_TOKEN");
 
@@ -269,13 +280,13 @@ int main() {
 
     mg_mgr_init(&mgr);
 
-    // Initialize the connection_last_activity array
-    ensure_connection_last_activity_size(1000);  // Start with space for 1000 connections
+    // Initialize the connections array
+    ensure_connection_capacity(1000);  // Start with space for 1000 connections
 
     struct mg_connection *nc = mg_http_listen(&mgr, "http://0.0.0.0:5671", ev_handler, NULL);
     if (nc == NULL) {
         fprintf(stderr, "Failed to create listener.\n");
-        free(connection_last_activity);
+        free(connections);
         mg_mgr_free(&mgr);
         return 1;
     }
@@ -286,18 +297,18 @@ int main() {
     while (true) {
         mg_mgr_poll(&mgr, POLL_INTERVAL_MS);
 
-        // Perform cleanup every 2.5 minutes
-        if (time(NULL) - last_cleanup > 150) {
+        // Perform cleanup every CLEANUP_INTERVAL_SECONDS
+        if (time(NULL) - last_cleanup > CLEANUP_INTERVAL_SECONDS) {
             cleanup_idle_connections(&mgr);
             last_cleanup = time(NULL);
         }
 
-        // Ensure we have enough space in the connection_last_activity array
-        ensure_connection_last_activity_size(mgr.nextid + 1);
+        // Ensure we have enough space in the connections array
+        ensure_connection_capacity(mgr.nextid + 1);
     }
 
     // Cleanup
-    free(connection_last_activity);
+    free(connections);
     mg_mgr_free(&mgr);
     return 0;
 }
