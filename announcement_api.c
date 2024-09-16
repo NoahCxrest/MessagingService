@@ -3,6 +3,7 @@
 #include <time.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include "mongoose.h"
 
@@ -216,7 +217,8 @@ static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
 
         case MG_EV_WS_MSG: {
             struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
-            if (mg_json_get(wm->data, "$.type") != NULL) {
+            int token_len;
+            if (mg_json_get(wm->data, wm->data.len, "$.type", &token_len) != NULL) {
                 connections[c->id].last_activity = time(NULL);
             }
             break;
