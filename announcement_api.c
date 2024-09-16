@@ -188,44 +188,52 @@ static void handle_clear_announcement(struct mg_connection *c, struct mg_http_me
 
 // WebSocket event handler
 static void handle_websocket(struct mg_connection *c, int ev, void *ev_data) {
-    ensure_connection_capacity(c->id + 1);
+    if (ev == MG_EV_WS_OPEN) {
+        // WebSocket connection is established
+        c->is_websocket = 1;
+        atomic_fetch_add(&connection_count, 1);
+        mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_BINARY);
 
-    switch (ev) {
-        case MG_EV_WS_OPEN:
-            connections[c->id].is_websocket = true;
-            connections[c->id].last_activity = time(NULL);
-            atomic_fetch_add(&connection_count, 1);
-            mg_ws_send(c, "{\"type\":\"connected\"}", 20, WEBSOCKET_OP_TEXT);
+        // Initialize last activity time for this connection
+        ensure_connection_last_activity_size(c->id + 1);
+        connection_last_activity[c->id] = time(NULL);
 
-            char buffer[MAX_MESSAGE_LENGTH];
-            time_t expires_at;
-            if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
-                char announcement_message[512];
-                int len = snprintf(announcement_message, sizeof(announcement_message),
-                                   "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
-                                   buffer, (long)expires_at);
-                mg_ws_send(c, announcement_message, len, WEBSOCKET_OP_TEXT);
-            }
-            break;
-
-        case MG_EV_CLOSE:
-            if (connections[c->id].is_websocket) {
-                atomic_fetch_sub(&connection_count, 1);
-                connections[c->id].is_websocket = false;
-            }
-            break;
-
-        case MG_EV_WS_MSG: {
-            struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
-            int token_len;
-            if (mg_json_get(wm->data, wm->data.len, "$.type", &token_len) != NULL) {
-                connections[c->id].last_activity = time(NULL);
-            }
-            break;
+        // Send current announcement if any
+        char buffer[MAX_MESSAGE_LENGTH];
+        time_t expires_at;
+        if (get_announcement(buffer, sizeof(buffer), &expires_at)) {
+            char announcement_message[512];
+            snprintf(announcement_message, sizeof(announcement_message),
+                     "{\"type\":\"announcement\",\"message\":\"%s\",\"expiresat\":%ld}",
+                     buffer, (long)expires_at);
+            mg_ws_send(c, announcement_message, strlen(announcement_message), WEBSOCKET_OP_BINARY);
         }
+    } else if (ev == MG_EV_CLOSE) {
+        // WebSocket connection is closed
+        if (c->is_websocket) {
+            atomic_fetch_sub(&connection_count, 1);
+        }
+    } else if (ev == MG_EV_WS_MSG) {
+        // WebSocket message received
+        struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
 
-        default:
-            break;
+        // Parse JSON message
+        struct json_token type_token = JSON_INVALID_TOKEN;
+        json_scanf(wm->data.ptr, wm->data.len, "{type:%T}", &type_token);
+
+        if (type_token.len > 0) {
+            // Check if the message type is "heartbeat"
+            if (strncmp(type_token.ptr, "heartbeat", type_token.len) == 0) {
+                // Update last activity time for this connection
+                ensure_connection_last_activity_size(c->id + 1);
+                connection_last_activity[c->id] = time(NULL);
+            } else {
+                // Handle other message types (e.g., custom actions)
+                char buffer[MAX_MESSAGE_LENGTH];
+                snprintf(buffer, sizeof(buffer), "{\"type\":\"message_received\",\"message\":\"%.*s\"}", (int) wm->data.len, wm->data.ptr);
+                mg_ws_send(c, buffer, strlen(buffer), WEBSOCKET_OP_BINARY);
+            }
+        }
     }
 }
 
